@@ -1,0 +1,281 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: growi-on-k8s
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: quota
+  namespace: growi-on-k8s
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: growi-on-k8s
+  name: mongo-svc
+spec:
+  type: ClusterIP
+  selector:
+    managed-by: mongo-sts
+  ports:
+    - name: mongo-port
+      port: 27017
+      targetPort: 27017
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo-sts
+  namespace: growi-on-k8s
+  labels:
+    app: mongo
+    component: database
+    part-of: growi
+spec:
+  serviceName: mongo-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      managed-by: mongo-sts
+  template:
+    metadata:
+      labels:
+        managed-by: mongo-sts
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:3.6
+          ports:
+            - containerPort: 27017
+          volumeMounts:
+            - mountPath: /data/configdb
+              name: mongo-configdb
+            - mountPath: /data/db
+              name: mongo-db
+          resources:
+            requests:
+              cpu: 0.05
+              memory: 0.5Gi
+              ephemeral-storage: 0.5Gi
+            limits:
+              cpu: 1
+              memory: 1Gi
+              ephemeral-storage: 0.5Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: mongo-configdb
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 0.5Gi
+    - metadata:
+        name: mongo-db
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 40Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: es-svc
+  namespace: growi-on-k8s
+spec:
+  type: ClusterIP
+  selector:
+    managed-by: es-sts
+  ports:
+    - name: es-port
+      port: 9200
+      targetPort: 9200
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: es-sts
+  namespace: growi-on-k8s
+  labels:
+    app: elasticsearch
+    component: search-engine
+    part-of: growi
+spec:
+  serviceName: es-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      managed-by: es-sts
+  template:
+    metadata:
+      labels:
+        managed-by: es-sts
+    spec:
+      initContainers:
+      # Elasticsearchの権限修正
+        - name: permissions-fix
+          image: busybox
+          volumeMounts:
+            - name: es-data
+              mountPath: /usr/share/elasticsearch/data
+          command: [ 'chown' ]
+          args: [ '1000:1000', '/usr/share/elasticsearch/data' ]
+      containers:
+        - name: elasticsearch
+          image: gcr.io/example-project-id/growi-on-k8s-es
+          env:
+            - name: ES_JAVA_OPTS
+              value: -Xms512m -Xmx512m
+            - name: bootstrap.memory_lock
+              value: "true"
+          ports:
+            - containerPort: 9200
+          volumeMounts:
+            - name: es-data
+              mountPath: /usr/share/elasticsearch/data
+          resources:
+            requests:
+              cpu: 0.05
+              memory: 1Gi
+              ephemeral-storage: 0.5Gi
+            limits:
+              cpu: 1
+              memory: 3Gi
+              ephemeral-storage: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: es-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: growi-sts
+  labels:
+    app: growi
+  namespace: growi-on-k8s
+spec:
+  serviceName: growi-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      managed-by: growi-sts
+  template:
+    metadata:
+      labels:
+        managed-by: growi-sts
+    spec:
+      containers:
+        - name: growi
+          image: gcr.io/example-project-id/growi-on-k8s-growi
+          env:
+            - name: APP_SITE_URL
+              value: https://example.com/
+            - name: ELASTICSEARCH_URI
+              value: http://es-svc:9200/growi
+            - name: MONGO_URI
+              value: mongodb://mongo-svc:27017/growi
+            - name: FILE_UPLOAD
+              value: local
+          args:
+            - dockerize
+            - -wait
+            - tcp://mongo-svc:27017
+            - -wait
+            - tcp://es-svc:9200
+            - -timeout
+            - 60s
+            - npm
+            - run
+            - server:prod
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - mountPath: /data
+              name: growi-data
+          resources:
+            requests:
+              cpu: 0.05
+              memory: 0.2Gi
+              ephemeral-storage: 0.5Gi
+            limits:
+              cpu: 1
+              memory: 0.5Gi
+              ephemeral-storage: 0.5Gi
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: 3000
+            initialDelaySeconds: 30
+            timeoutSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: growi-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 4.5Gi
+---
+apiVersion: cloud.google.com/v1beta1
+kind: BackendConfig
+metadata:
+  name: growi-on-k8s-backconf
+  labels:
+    app: backend-conf
+    component: security-policy
+  namespace: growi-on-k8s
+spec:
+  securityPolicy:
+    name: growi-on-k8s-armor
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: growi
+  namespace: growi-on-k8s
+  annotations:
+    beta.cloud.google.com/backend-config: '{"ports": {"3000":"growi-on-k8s-backconf"}}'
+spec:
+  type: NodePort
+  selector:
+    managed-by: growi-sts
+  ports:
+    - name: growi-port
+      port: 3000
+      targetPort: 3000
+---
+apiVersion: networking.gke.io/v1beta1
+kind: ManagedCertificate
+metadata:
+  name: growi-on-k8s-cert
+  namespace: growi-on-k8s
+spec:
+  domains:
+    - example.com
+---
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: growi-ing
+  labels:
+    app: ingress
+    component: L7-load-balancer
+  namespace: growi-on-k8s
+  annotations:
+    kubernetes.io/ingress.global-static-ip-name: growi-on-k8s-ip
+    networking.gke.io/managed-certificates: growi-on-k8s-cert
+    # kubernetes.io/ingress.allow-http: "false"
+spec:
+  backend:
+    serviceName: growi
+    servicePort: 3000
